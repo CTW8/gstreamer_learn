@@ -1,0 +1,17 @@
+prefix=/Users/lizhen/Documents/library/gstreamer/out
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+graphene_has_sse2=0
+graphene_has_gcc=0
+graphene_has_neon=1
+graphene_has_scalar=1
+
+Name: Graphene
+Description: Math classes for graphic libraries
+URL: https://ebassi.github.io/graphene
+Version: 1.10.8
+Requires.private: gobject-2.0
+Libs: -L${libdir} -lgraphene-1.0
+Libs.private: -lm
+Cflags: -I${includedir}/graphene-1.0 -I${libdir}/graphene-1.0/include

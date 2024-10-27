@@ -1,0 +1,10 @@
+prefix=/Users/lizhen/Documents/library/gstreamer/out
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: libdv
+Description: DV software codec library
+Version: 1.0.0
+Libs: -L${libdir} -ldv
+Libs.private: -lm
+Cflags: -I${includedir}

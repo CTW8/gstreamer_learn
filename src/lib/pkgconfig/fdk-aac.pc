@@ -1,0 +1,10 @@
+prefix=/Users/lizhen/Documents/library/gstreamer/out
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: fdk-aac
+Description: AAC codec library
+Version: 2.0.2
+Libs: -L${libdir} -lfdk_aac
+Libs.private: -lm
+Cflags: -I${includedir}

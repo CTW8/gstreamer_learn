@@ -1,0 +1,9 @@
+prefix=/Users/lizhen/Documents/library/gstreamer/out
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: microDNS
+Description: mDNS simple implementation
+Version: 0.2.0
+Libs: -L${libdir} -lmicrodns
+Cflags: -I${includedir}

@@ -1,0 +1,9 @@
+prefix=/Users/lizhen/Documents/library/gstreamer/out
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: orc-test
+Description: Test Library of Optimized Inner Loops Runtime Compiler
+Version: 0.4.39.1
+Libs: -L${libdir} -lorc-test-0.4 -lm -lorc-0.4
+Cflags: -I${includedir}/orc-0.4
