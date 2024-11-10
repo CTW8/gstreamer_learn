@@ -1,4 +1,4 @@
-#define PACKAGE "my_demux_plugin"
+#define PACKAGE "my_plugin"
 #include "my_demux.h"
 #include <gst/gst.h>
 #include <libavformat/avformat.h>
