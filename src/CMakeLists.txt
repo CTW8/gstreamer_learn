@@ -6,7 +6,7 @@ set(ROOT_SRC "${CMAKE_SOURCE_DIR}")
 # 指定源文件所在的目录
 set(SOURCE_DIR "${CMAKE_SOURCE_DIR}/")
 
-add_definitions(-DGST_DEBUG)
+# add_definitions(-DGST_DEBUG)
 add_definitions(-DGST_LEVEL=5) 
 
 # 搜索目录中的所有 .c 文件

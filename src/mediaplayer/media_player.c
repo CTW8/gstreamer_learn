@@ -4,6 +4,7 @@
 #define FILE_PATH "/Users/lizhen/Downloads/test.mp4"
 
 static void on_pad_added(GstElement *src, GstPad *new_pad, gpointer user_data) {
+    g_print("INFO: [media_player] on_pad_added\n\n\n\n");
     GstElement *pipeline = GST_ELEMENT(user_data);
     GstPad *sink_pad = NULL;
     GstCaps *new_pad_caps = NULL;
@@ -23,17 +24,19 @@ static void on_pad_added(GstElement *src, GstPad *new_pad, gpointer user_data) {
     g_print("New pad type: %s\n", new_pad_type);
     g_print("Source pad caps: %s\n", gst_caps_to_string(new_pad_caps));
 
-    if (g_str_has_prefix(new_pad_type, "audio/x-aac")) {
+    if (g_str_has_prefix(new_pad_type, "audio/mpeg")) {
         // 链接到音频分支
         GstElement *audio_decoder = gst_bin_get_by_name(GST_BIN(pipeline), "audio-decoder");
         if (audio_decoder) {
             sink_pad = gst_element_get_static_pad(audio_decoder, "sink");
             if (sink_pad) {
+                g_print("Sink pad caps: %s\n", gst_caps_to_string(gst_pad_get_current_caps(sink_pad)));
                 GstPadLinkReturn ret = gst_pad_link(new_pad, sink_pad);
                 if (ret != GST_PAD_LINK_OK) {
                     g_printerr("Failed to link new pad to audio decoder sink pad.\n");
                 } else {
                     g_print("#1 Successfully linked audio decoder.\n");
+                    g_print("Downstream element sink pad caps: %s\n", gst_caps_to_string(gst_pad_get_current_caps(sink_pad)));
                 }
                 gst_object_unref(sink_pad);
             }
@@ -45,11 +48,13 @@ static void on_pad_added(GstElement *src, GstPad *new_pad, gpointer user_data) {
         if (h264parse) {
             sink_pad = gst_element_get_static_pad(h264parse, "sink");
             if (sink_pad) {
+                g_print("Sink pad caps: %s\n", gst_caps_to_string(gst_pad_get_current_caps(sink_pad)));
                 GstPadLinkReturn ret = gst_pad_link(new_pad, sink_pad);
                 if (ret != GST_PAD_LINK_OK) {
                     g_printerr("Failed to link new pad to h264parse sink pad.\n");
                 } else {
                     g_print("#2 Successfully linked h264parse.\n");
+                    g_print("Downstream element sink pad caps: %s\n", gst_caps_to_string(gst_pad_get_current_caps(sink_pad)));
                 }
                 gst_object_unref(sink_pad);
             }
@@ -103,6 +108,9 @@ int media_player(const char *file_path){
         gst_object_unref(pipeline);
         return -1;
     }
+
+
+    g_print("### Sink pad caps: %s\n", gst_caps_to_string(gst_pad_get_current_caps(gst_element_get_static_pad(h264parse, "sink"))));
 
     // 连接 demux 的 pad-added 信号
     g_signal_connect(demux, "pad-added", G_CALLBACK(on_pad_added), pipeline);
