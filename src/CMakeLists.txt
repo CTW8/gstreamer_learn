@@ -8,6 +8,7 @@ set(SOURCE_DIR "${CMAKE_SOURCE_DIR}/")
 
 # add_definitions(-DGST_DEBUG)
 add_definitions(-DGST_LEVEL=5) 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 搜索目录中的所有 .c 文件
 file(GLOB_RECURSE SOURCES "${SOURCE_DIR}/*.c")

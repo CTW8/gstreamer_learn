@@ -1,576 +1,575 @@
-#define PACKAGE "mediamdemux"
+#define PACKAGE "my_plugin"
+#include "media_demux.h"
 #include <gst/gst.h>
-#include <gst/base/gstpushsrc.h>
-#include <gst/audio/audio.h>
-#include <gst/video/video.h>
+#include <gst/gstsegment.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
-#include <libavutil/opt.h>
-#include <libavutil/timestamp.h>
-#include <libavutil/mathematics.h>
-#include <libavutil/time.h>
-#include <libavutil/pixdesc.h> // 添加此行
-#include "media_demux.h" // 确保此头文件正确定义
+#include <pthread.h>
+#include <string.h>
 
+/* Define private structure */
 typedef struct _MediaDemuxPrivate {
     AVFormatContext *fmt_ctx;
-    GList *video_src_pads; // 支持多个视频 Pad
-    GList *audio_src_pads; // 支持多个音频 Pad
     gboolean started;
-    GstTask *task;
-    GRecMutex *task_lock;
+    GstPad *video_src_pad;
+    GstPad *audio_src_pad;
     gchar *location;
-    // gchar *group_id; // 移除此字段
+    gboolean is_demuxing;
+    pthread_t demux_thread;
+    GstCaps *video_caps;
+    GstCaps *audio_caps;
+    gint video_stream_idx;
+    gint audio_stream_idx;
+    enum AVMediaType media_type;
+    /* For audio caps parameters */
+    gboolean is_adts;
+    gint mpeg_version;
+    /* For video caps parameters */
+    GstBuffer *codec_data;  // SPS and PPS for H.264/H.265
+    gchar *profile;
+    gint level;
 } MediaDemuxPrivate;
 
-typedef struct _MediaDemux {
-    GstElement parent;
-    // 不需要显式地定义 MediaDemuxPrivate *priv;
-} MediaDemux;
+struct _MediaDemux {
+    GstElement element;
+};
 
-G_DEFINE_TYPE_WITH_PRIVATE(MediaDemux, media_demux, GST_TYPE_ELEMENT);
+/* Get private data */
+G_DEFINE_TYPE_WITH_PRIVATE(MediaDemux, media_demux, GST_TYPE_ELEMENT)
 
-// 定义属性枚举
+/* Property enumeration */
 enum {
     PROP_0,
     PROP_LOCATION,
+    /* Add other properties here */
 };
 
-// Pad templates
-static GstStaticPadTemplate src_template_audio =
-    GST_STATIC_PAD_TEMPLATE("audio_src_%u",
-                            GST_PAD_SRC,
-                            GST_PAD_SOMETIMES, // 改为 GST_PAD_SOMETIMES
-                            GST_STATIC_CAPS("audio/mpeg"));
+/* Pad templates */
+static GstStaticPadTemplate video_src_template = GST_STATIC_PAD_TEMPLATE(
+    "video_src_%u",
+    GST_PAD_SRC,
+    GST_PAD_SOMETIMES,
+    GST_STATIC_CAPS("video/x-h264")
+);
 
-static GstStaticPadTemplate src_template_video =
-    GST_STATIC_PAD_TEMPLATE("video_src_%u",
-                            GST_PAD_SRC,
-                            GST_PAD_SOMETIMES, // 改为 GST_PAD_SOMETIMES
-                            GST_STATIC_CAPS("video/x-h264"));
+static GstStaticPadTemplate audio_src_template = GST_STATIC_PAD_TEMPLATE(
+    "audio_src_%u",
+    GST_PAD_SRC,
+    GST_PAD_SOMETIMES,
+    GST_STATIC_CAPS_ANY
+);
 
-// 函数声明
-static gboolean media_demux_start(MediaDemux *demux);
-static gboolean media_demux_stop(MediaDemux *demux);
-static GstFlowReturn media_demux_push_data(MediaDemux *demux);
-static void media_demux_loop(MediaDemux *demux);
-static GstStateChangeReturn media_demux_change_state(GstElement *element, GstStateChange transition);
+static GstBuffer* get_codec_data(AVCodecParameters *codecpar);
 
-// 属性设置函数
-static void media_demux_set_property(GObject *object, guint prop_id,
-                                     const GValue *value, GParamSpec *pspec) {
-    MediaDemux *demux = (MediaDemux *)object;
+/* Set property function */
+static void media_demux_set_property(GObject *object, guint prop_id, const GValue *value, GParamSpec *pspec) {
+    MediaDemux *demux = MEDIA_DEMUX(object);
     MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-
     switch (prop_id) {
         case PROP_LOCATION:
             g_free(priv->location);
             priv->location = g_value_dup_string(value);
             break;
         default:
-            g_print("WARNING: [media_demux] Unknown property ID %u\n", prop_id);
+            G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
             break;
     }
 }
 
-static void media_demux_get_property(GObject *object, guint prop_id,
-                                     GValue *value, GParamSpec *pspec) {
-    MediaDemux *demux = (MediaDemux *)object;
+/* Get property function */
+static void media_demux_get_property(GObject *object, guint prop_id, GValue *value, GParamSpec *pspec) {
+    MediaDemux *demux = MEDIA_DEMUX(object);
     MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-
     switch (prop_id) {
         case PROP_LOCATION:
             g_value_set_string(value, priv->location);
             break;
         default:
-            g_print("WARNING: [media_demux] Unknown property ID %u\n", prop_id);
+            G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
             break;
     }
 }
 
-static GstPad* create_and_add_pad(MediaDemux *demux, AVStream *stream) {
-    MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-    GstPadTemplate *template;
-    gchar pad_name[32];
-    GstPad *pad;
-
-    if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-        template = gst_static_pad_template_get(&src_template_video);
-        g_snprintf(pad_name, sizeof(pad_name), "video_src_%u", priv->video_src_pads ? g_list_length(priv->video_src_pads) : 0);
-    } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-        template = gst_static_pad_template_get(&src_template_audio);
-        g_snprintf(pad_name, sizeof(pad_name), "audio_src_%u", priv->audio_src_pads ? g_list_length(priv->audio_src_pads) : 0);
-    } else {
-        // Unsupported stream type
-        return NULL;
-    }
-
-    pad = gst_pad_new_from_template(template, pad_name);
-    gst_object_unref(template);
-
-    if (!pad) {
-        g_print("ERROR: [media_demux] Failed to create pad from template\n");
-        return NULL;
-    }
-
-    if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-        priv->video_src_pads = g_list_append(priv->video_src_pads, pad);
-    } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-        priv->audio_src_pads = g_list_append(priv->audio_src_pads, pad);
-    }
-
-    if (!gst_element_add_pad(GST_ELEMENT(demux), pad)) {
-        g_print("ERROR: [media_demux] Failed to add pad to element\n");
-        gst_object_unref(pad);
-        return NULL;
-    }
-
-    gst_pad_set_active(pad, TRUE);
-
-    // 生成唯一的 stream-id
-    gchar *stream_id = g_strdup_printf("%s_%u", pad_name, (unsigned int)(g_list_length(priv->video_src_pads) + g_list_length(priv->audio_src_pads)));
-
-    // 发送 stream-start 事件，使用唯一的 stream-id
-    GstEvent *stream_start_event = gst_event_new_stream_start(stream_id);
-    gst_pad_push_event(pad, stream_start_event);
-    g_print("INFO: [media_demux] Sent stream-start with stream-id: %s to pad: %s\n", stream_id, pad_name);
-    g_free(stream_id); // 释放独立的 stream-id
-
-    // 定义 Caps
-    GstCaps *caps = NULL;
-    if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-        const char *pix_fmt = av_get_pix_fmt_name(stream->codecpar->format);
-        if (!pix_fmt) {
-            pix_fmt = "I420"; // Default format
-        }
-
-        // 获取 codec data
-        GstBuffer *codec_data = gst_buffer_new_allocate(NULL, stream->codecpar->extradata_size, NULL);
-        GstMapInfo map;
-        if (gst_buffer_map(codec_data, &map, GST_MAP_WRITE)) {
-            memcpy(map.data, stream->codecpar->extradata, stream->codecpar->extradata_size);
-            gst_buffer_unmap(codec_data, &map);
-        } else {
-            g_print("ERROR: [media_demux] Failed to map codec_data buffer\n");
-            gst_buffer_unref(codec_data);
-            return NULL;
-        }
-
-        caps = gst_caps_new_simple("video/x-h264",
-                                   "stream-format", G_TYPE_STRING, "avc",
-                                   "alignment", G_TYPE_STRING, "au",
-                                   "width", G_TYPE_INT, stream->codecpar->width,
-                                   "height", G_TYPE_INT, stream->codecpar->height,
-                                   "codec_data", GST_TYPE_BUFFER, codec_data,
-                                   NULL);
-        gst_buffer_unref(codec_data);
-    } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-        const char *audio_fmt = NULL;
-        switch (stream->codecpar->format) {
-            case AV_SAMPLE_FMT_S16:
-                audio_fmt = "S16LE";
-                break;
-            case AV_SAMPLE_FMT_FLT:
-                audio_fmt = "F32LE";
-                break;
-            // Add more formats as needed
+/* Helper function: Get MIME type based on codec_id and media_type */
+static const gchar* get_mime_type(enum AVCodecID codec_id, enum AVMediaType media_type) {
+    if (media_type == AVMEDIA_TYPE_VIDEO) {
+        switch (codec_id) {
+            case AV_CODEC_ID_H264:
+                return "video/x-h264";
+            case AV_CODEC_ID_HEVC:
+                return "video/x-h265";
+            case AV_CODEC_ID_MPEG4:
+                return "video/mpeg";
+            /* Add support for other video codecs */
             default:
-                audio_fmt = "S16LE"; // Default format
-                break;
+                return "video/x-unknown";
         }
-
-        gint mpeg_version = 1; // 默认值
-        const char *stream_format = "raw"; // 默认值
-
-        if (stream->codecpar->codec_id == AV_CODEC_ID_MP3) {
-            mpeg_version = 1;
-            stream_format = "mp3";
-        } else if (stream->codecpar->codec_id == AV_CODEC_ID_AAC) {
-            mpeg_version = 2;
-            stream_format = "adts";
+    } else if (media_type == AVMEDIA_TYPE_AUDIO) {
+        switch (codec_id) {
+            case AV_CODEC_ID_AAC:
+                return "audio/mpeg";
+            case AV_CODEC_ID_MP3:
+                return "audio/mpeg";
+            /* Add support for other audio codecs */
+            default:
+                return "audio/x-unknown";
         }
-
-        caps = gst_caps_new_simple("audio/mpeg", 
-                                   "mpegversion", G_TYPE_INT, mpeg_version,
-                                   "stream-format", G_TYPE_STRING, stream_format,
-                                   NULL);
     }
-
-    if (caps) {
-        // 发送 caps 事件
-        GstEvent *caps_event = gst_event_new_caps(caps);
-        gst_caps_unref(caps);
-        gst_pad_push_event(pad, caps_event);
-    }
-
-    // 发送 segment event
+    return "application/octet-stream";
+}
+static gboolean media_demux_start(MediaDemux *demux) {
+    g_print("media_demux_start\n");
+    MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
+    AVStream *stream;
+    gchar *stream_id;
+    GstEvent *stream_start_event, *caps_event, *segment_event;
     GstSegment segment;
-    gst_segment_init(&segment, GST_FORMAT_TIME);
-    segment.duration = GST_CLOCK_TIME_NONE;
-    segment.position = 0;
-    segment.rate = 1.0;
-    GstEvent *segment_event = gst_event_new_segment(&segment);
-    gst_pad_push_event(pad, segment_event);
 
-    // Emit pad-added signal
-    g_signal_emit_by_name(G_OBJECT(demux), "pad-added", pad);
+    if (avformat_open_input(&priv->fmt_ctx, priv->location, NULL, NULL) != 0) {
+        g_print("Failed to open input file: %s\n", priv->location);
+        return FALSE;
+    }
 
-    return pad;
+    if (avformat_find_stream_info(priv->fmt_ctx, NULL) < 0) {
+        g_print("Failed to find stream information\n");
+        avformat_close_input(&priv->fmt_ctx);
+        return FALSE;
+    }
+
+    /* Select the first valid video and audio streams */
+    priv->video_stream_idx = -1;
+    priv->audio_stream_idx = -1;
+    for (unsigned int i = 0; i < priv->fmt_ctx->nb_streams; i++) {
+        enum AVMediaType type = priv->fmt_ctx->streams[i]->codecpar->codec_type;
+        if (type == AVMEDIA_TYPE_VIDEO && priv->video_stream_idx == -1) {
+            priv->video_stream_idx = i;
+        } else if (type == AVMEDIA_TYPE_AUDIO && priv->audio_stream_idx == -1) {
+            priv->audio_stream_idx = i;
+        }
+        if (priv->video_stream_idx != -1 && priv->audio_stream_idx != -1) {
+            break;
+        }
+    }
+
+    if (priv->video_stream_idx == -1 && priv->audio_stream_idx == -1) {
+        g_print("No valid audio or video stream found\n");
+        avformat_close_input(&priv->fmt_ctx);
+        return FALSE;
+    }
+
+    /* Process video stream */
+    if (priv->video_stream_idx != -1) {
+        g_print("####start video stream\n");
+        stream = priv->fmt_ctx->streams[priv->video_stream_idx];
+
+        GstPadTemplate *video_pad_template = gst_static_pad_template_get(&video_src_template);
+        gchar *pad_name = g_strdup_printf("video_src_%u", stream->index);
+        priv->video_src_pad = gst_pad_new_from_template(video_pad_template, pad_name);
+        gst_object_unref(video_pad_template);
+        g_free(pad_name);
+        g_print("### %s #1\n", __FUNCTION__);
+        if (!priv->video_src_pad) {
+            g_print("Failed to create video pad from template\n");
+            return FALSE;
+        }
+
+        g_print("### %s #21\n", __FUNCTION__);
+        gst_pad_set_active(priv->video_src_pad, TRUE);
+        g_print("gst_pad_set_active(priv->video_src_pad, TRUE)\n");
+        /* Send stream-start event */
+        stream_id = gst_pad_create_stream_id(priv->video_src_pad, GST_ELEMENT(demux), pad_name);
+        stream_start_event = gst_event_new_stream_start(stream_id);
+        g_free(stream_id);
+        gst_pad_push_event(priv->video_src_pad, stream_start_event);
+
+        /* Set Caps based on codec parameters */
+        const gchar *stream_format = (stream->codecpar->codec_id == AV_CODEC_ID_H264) ? "avc" : "hvc1";
+        GstBuffer *codec_data = get_codec_data(stream->codecpar);
+        GstCaps *caps = gst_caps_new_simple(
+            "video/x-h264",
+            "stream-format", G_TYPE_STRING, stream_format,
+            "alignment", G_TYPE_STRING, "au",
+            "width", G_TYPE_INT, stream->codecpar->width,
+            "height", G_TYPE_INT, stream->codecpar->height,
+            "framerate", GST_TYPE_FRACTION, stream->avg_frame_rate.num, stream->avg_frame_rate.den,
+            "codec_data", GST_TYPE_BUFFER, codec_data,
+            NULL
+        );
+        gst_buffer_unref(codec_data);
+        g_print("### %s #4\n", __FUNCTION__);
+        if (!gst_pad_set_caps(priv->video_src_pad, caps)) {
+            g_printerr("Failed to set caps on video pad\n");
+            return FALSE;
+        }
+        g_print("### %s #6\n", __FUNCTION__);
+        caps_event = gst_event_new_caps(caps);
+        gst_pad_push_event(priv->video_src_pad, caps_event);
+        gst_caps_unref(caps);
+
+        /* Send segment event */
+        gst_segment_init(&segment, GST_FORMAT_TIME);
+        segment_event = gst_event_new_segment(&segment);
+        gst_pad_push_event(priv->video_src_pad, segment_event);
+
+        GstCaps *current_caps = gst_pad_get_current_caps(priv->video_src_pad);
+        gchar *caps_str = gst_caps_to_string(current_caps);
+        g_print("[MediaDemxu] Current caps of video_src_pad: %s\n", caps_str);
+        g_free(caps_str);
+        gst_caps_unref(current_caps);
+
+        // g_signal_emit_by_name(demux, "pad-added", priv->video_src_pad);
+        if (!gst_element_add_pad(GST_ELEMENT(demux), priv->video_src_pad)) {
+            g_print("Failed to add video pad to element\n");
+            gst_object_unref(priv->video_src_pad);
+            return FALSE;
+        }
+    }
+
+    /* Process audio stream */
+    if (priv->audio_stream_idx != -1) {
+        g_print("start audio stream\n");
+        stream = priv->fmt_ctx->streams[priv->audio_stream_idx];
+        GstPadTemplate *audio_pad_template = gst_static_pad_template_get(&audio_src_template);
+        gchar *pad_name = g_strdup_printf("audio_src_%u", stream->index);
+        priv->audio_src_pad = gst_pad_new_from_template(audio_pad_template, pad_name);
+        gst_object_unref(audio_pad_template);
+        g_free(pad_name);
+
+        if (!priv->audio_src_pad) {
+            g_print("Failed to create audio pad from template\n");
+            return FALSE;
+        }
+
+        gst_pad_set_active(priv->audio_src_pad, TRUE);
+
+        /* Send stream-start event */
+        stream_id = gst_pad_create_stream_id(priv->audio_src_pad, GST_ELEMENT(demux), pad_name);
+        stream_start_event = gst_event_new_stream_start(stream_id);
+        g_free(stream_id);
+        gst_pad_push_event(priv->audio_src_pad, stream_start_event);
+
+        /* Set Caps based on codec parameters */
+        const gchar *stream_format = (stream->codecpar->codec_id == AV_CODEC_ID_AAC) ? "adts" : "raw";
+        GstCaps *caps = gst_caps_new_simple(
+            "audio/mpeg",
+            "mpegversion", G_TYPE_INT, 4,
+            "stream-format", G_TYPE_STRING, stream_format,
+            "rate", G_TYPE_INT, stream->codecpar->sample_rate,
+            "channels", G_TYPE_INT, stream->codecpar->ch_layout.nb_channels,
+            NULL
+        );
+
+        if (!gst_pad_set_caps(priv->audio_src_pad, caps)) {
+            g_printerr("Failed to set caps on audio pad\n");
+            return FALSE;
+        }
+
+        caps_event = gst_event_new_caps(caps);
+        gst_pad_push_event(priv->audio_src_pad, caps_event);
+        gst_caps_unref(caps);
+
+        /* Send segment event */
+        gst_segment_init(&segment, GST_FORMAT_TIME);
+        segment_event = gst_event_new_segment(&segment);
+        gst_pad_push_event(priv->audio_src_pad, segment_event);
+
+        GstCaps *current_caps = gst_pad_get_current_caps(priv->audio_src_pad);
+        gchar *caps_str = gst_caps_to_string(current_caps);
+        g_print("Audio src pad caps: %s\n", caps_str);
+        g_free(caps_str);
+        gst_caps_unref(current_caps);
+
+        // g_signal_emit_by_name(demux, "pad-added", priv->audio_src_pad);
+        if (!gst_element_add_pad(GST_ELEMENT(demux), priv->audio_src_pad)) {
+            g_print("Failed to add audio pad to element\n");
+            gst_object_unref(priv->audio_src_pad);
+            return FALSE;
+        }
+    }
+
+    priv->started = TRUE;
+
+    return TRUE;
 }
 
-static void media_demux_class_init(MediaDemuxClass *klass) {
-    GstElementClass *element_class = GST_ELEMENT_CLASS(klass);
-    GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
+static gchar* gst_buffer_to_hex_string(GstBuffer *buffer) {
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        return NULL;
+    }
 
-    // 设置元数据
-    gst_element_class_set_static_metadata(element_class,
-                                          "Media Demuxer",
-                                          "Demuxer",
-                                          "Demuxes media streams using FFmpeg",
-                                          "Your Name <youremail@example.com>");
+    gchar *hex_str = g_malloc(map.size * 2 + 1); // Each byte becomes two hex characters
+    for (gsize i = 0; i < map.size; i++) {
+        sprintf(&hex_str[i * 2], "%02x", map.data[i]);
+    }
+    hex_str[map.size * 2] = '\0';
 
-    // 设置状态改变函数
-    element_class->change_state = media_demux_change_state;
-
-    // 设置属性设置和获取函数
-    gobject_class->set_property = media_demux_set_property;
-    gobject_class->get_property = media_demux_get_property;
-
-    // 注册 location 属性
-    g_object_class_install_property(gobject_class, PROP_LOCATION,
-        g_param_spec_string("location", "Location", "Location of the media to demux", NULL,
-                            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    gst_buffer_unmap(buffer, &map);
+    return hex_str;
+}
+/* Helper function: Get H.264/H.265 codec data (SPS and PPS) */
+static GstBuffer* get_codec_data(AVCodecParameters *codecpar) {
+    if (codecpar->extradata && codecpar->extradata_size > 0) {
+        GstBuffer *buffer = gst_buffer_new_allocate(NULL, codecpar->extradata_size, NULL);
+        gst_buffer_fill(buffer, 0, codecpar->extradata, codecpar->extradata_size);
+        return buffer;
+    }
+    return NULL;
 }
 
-static void media_demux_init(MediaDemux *demux) {
+/* Helper function: Add ADTS header to AAC frame */
+static GstBuffer* add_adts_header(GstBuffer *buffer, AVCodecParameters *codecpar) {
+    GstMapInfo map;
+    gst_buffer_map(buffer, &map, GST_MAP_READ);
+
+    guint8 adts_header[7];
+    guint16 frame_length = map.size + 7;
+
+    static const guint8 sample_rate_index[] = {
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350
+    };
+    guint8 sr_index = 0;
+    for (guint8 i = 0; i < G_N_ELEMENTS(sample_rate_index); i++) {
+        if (sample_rate_index[i] == codecpar->sample_rate) {
+            sr_index = i;
+            break;
+        }
+    }
+
+    adts_header[0] = 0xFF;
+    adts_header[1] = 0xF1; // Syncword and MPEG-4
+    adts_header[2] = ((codecpar->profile + 1) << 6) | (sr_index << 2) | ((codecpar->ch_layout.nb_channels >> 2) & 0x1);
+    adts_header[3] = ((codecpar->ch_layout.nb_channels & 0x3) << 6) | ((frame_length >> 11) & 0x3);
+    adts_header[4] = (frame_length >> 3) & 0xFF;
+    adts_header[5] = ((frame_length & 0x7) << 5) | 0x1F;
+    adts_header[6] = 0xFC;
+
+    GstBuffer *adts_buffer = gst_buffer_new_allocate(NULL, frame_length, NULL);
+    gst_buffer_fill(adts_buffer, 0, adts_header, 7);
+    gst_buffer_fill(adts_buffer, 7, map.data, map.size);
+
+    gst_buffer_unmap(buffer, &map);
+    gst_buffer_unref(buffer);
+
+    return adts_buffer;
+}
+
+/* Demux thread function */
+static void *demux_thread_func(void *data) {
+    MediaDemux *demux = MEDIA_DEMUX(data);
     MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
+    AVPacket packet;
+    int ret;
 
-    priv->fmt_ctx = NULL;
-    priv->video_src_pads = NULL;
-    priv->audio_src_pads = NULL;
-    priv->started = FALSE;
-    priv->task = NULL;
-    priv->task_lock = g_new0(GRecMutex, 1);
-    g_rec_mutex_init(priv->task_lock);
-    priv->location = NULL; // 需要通过属性或其他方式设置 location
+    av_init_packet(&packet);
+    while (priv->is_demuxing && (ret = av_read_frame(priv->fmt_ctx, &packet)) >= 0) {
+        if (packet.stream_index == priv->video_stream_idx || packet.stream_index == priv->audio_stream_idx) {
+            GstBuffer *buffer;
 
-    // 移除 group_id 的生成
-    // uuid_t uuid;
-    // uuid_generate(uuid);
-    // gchar uuid_str[37]; // UUID 长度为36，加上终止符
-    // uuid_unparse_lower(uuid, uuid_str);
-    // priv->group_id = g_strdup(uuid_str);
-    // g_print("INFO: [media_demux] Generated group-id: %s\n", priv->group_id);
+            if (packet.stream_index == priv->audio_stream_idx) {
+                /* Convert audio to ADTS format */
+                buffer = gst_buffer_new_allocate(NULL, packet.size, NULL);
+                gst_buffer_fill(buffer, 0, packet.data, packet.size);
+                buffer = add_adts_header(buffer, priv->fmt_ctx->streams[packet.stream_index]->codecpar);
+            } else {
+                buffer = gst_buffer_new_allocate(NULL, packet.size, NULL);
+                gst_buffer_fill(buffer, 0, packet.data, packet.size);
+            }
+
+            g_print("Packet type: %s, PTS: %" GST_TIME_FORMAT ", Size: %d\n",
+                    (packet.stream_index == priv->video_stream_idx) ? "Video" : "Audio",
+                    GST_TIME_ARGS(packet.pts), packet.size);
+            /* Set timestamps */
+            GstClockTime pts = GST_CLOCK_TIME_NONE;
+            GstClockTime dts = GST_CLOCK_TIME_NONE;
+            if (packet.pts != AV_NOPTS_VALUE) {
+                pts = gst_util_uint64_scale(packet.pts, GST_SECOND * priv->fmt_ctx->streams[packet.stream_index]->time_base.num, priv->fmt_ctx->streams[packet.stream_index]->time_base.den);
+            }
+            if (packet.dts != AV_NOPTS_VALUE) {
+                dts = gst_util_uint64_scale(packet.dts, GST_SECOND * priv->fmt_ctx->streams[packet.stream_index]->time_base.num, priv->fmt_ctx->streams[packet.stream_index]->time_base.den);
+            }
+            GST_BUFFER_PTS(buffer) = pts;
+            GST_BUFFER_DTS(buffer) = dts;
+            GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(packet.duration, GST_SECOND * priv->fmt_ctx->streams[packet.stream_index]->time_base.num, priv->fmt_ctx->streams[packet.stream_index]->time_base.den);
+            g_print("PTS: %" GST_TIME_FORMAT ", DTS: %" GST_TIME_FORMAT "\n", GST_TIME_ARGS(pts), GST_TIME_ARGS(dts));
+            GstFlowReturn flow_ret;
+            if (packet.stream_index == priv->video_stream_idx) {
+                flow_ret = gst_pad_push(priv->video_src_pad, buffer);
+            } else {
+                flow_ret = gst_pad_push(priv->audio_src_pad, buffer);
+            }
+
+            if (flow_ret != GST_FLOW_OK) {
+                g_print("Failed to push buffer: %d\n", flow_ret);
+                gst_buffer_unref(buffer);
+                break;
+            }
+        }
+        av_packet_unref(&packet);
+    }
+
+    /* Check for errors */
+    if (ret < 0 && ret != AVERROR_EOF) {
+        g_print("Error reading frame: %s\n", av_err2str(ret));
+    }
+
+    /* Send EOS event */
+    if (priv->video_stream_idx != -1) {
+        GstEvent *eos_event = gst_event_new_eos();
+        gst_pad_push_event(priv->video_src_pad, eos_event);
+        g_print("EOS event sent on video pad\n");
+    }
+    if (priv->audio_stream_idx != -1) {
+        GstEvent *eos_event = gst_event_new_eos();
+        gst_pad_push_event(priv->audio_src_pad, eos_event);
+        g_print("EOS event sent on audio pad\n");
+    }
+    avformat_close_input(&priv->fmt_ctx);
+
+    /* Free allocated resources */
+    if (priv->codec_data) {
+        gst_buffer_unref(priv->codec_data);
+        priv->codec_data = NULL;
+    }
+
+    return NULL;
 }
 
-// 状态改变函数
+/* State change function */
 static GstStateChangeReturn media_demux_change_state(GstElement *element, GstStateChange transition) {
-    GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
-    MediaDemux *demux = (MediaDemux *)element;
+    MediaDemux *demux = MEDIA_DEMUX(element);
     MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
+    GstStateChangeReturn ret = GST_STATE_CHANGE_SUCCESS;
 
+    g_print("media_demux_change_state: %s\n", gst_element_state_get_name(transition));
     switch (transition) {
         case GST_STATE_CHANGE_NULL_TO_READY:
-            break;
-        case GST_STATE_CHANGE_READY_TO_PAUSED:
+            g_print("GST_STATE_CHANGE_NULL_TO_READY\n");
+            /* Check if location is set */
+            if (priv->location == NULL) {
+                g_print("Location property is not set\n");
+                return GST_STATE_CHANGE_FAILURE;
+            }
             if (!media_demux_start(demux)) {
-                g_print("ERROR: [media_demux] Failed to start demuxer\n");
+                g_print("Failed to start demuxing\n");
                 return GST_STATE_CHANGE_FAILURE;
             }
             break;
+        case GST_STATE_CHANGE_READY_TO_PAUSED:
+            g_print("GST_STATE_CHANGE_READY_TO_PAUSED\n");
+            priv->is_demuxing = TRUE;
+            if (pthread_create(&priv->demux_thread, NULL, demux_thread_func, demux) != 0) {
+                g_print("Failed to create demux thread\n");
+                priv->is_demuxing = FALSE;
+                return GST_STATE_CHANGE_FAILURE;
+            }
+            break;
+        case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+            g_print("GST_STATE_CHANGE_PAUSED_TO_PLAYING\n");
+            /* Add logic if needed */
+            break;
+        case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+            g_print("GST_STATE_CHANGE_PLAYING_TO_PAUSED\n");
+            /* Stop demuxing */
+            priv->is_demuxing = FALSE;
+            pthread_join(priv->demux_thread, NULL);
+            break;
         case GST_STATE_CHANGE_PAUSED_TO_READY:
-            media_demux_stop(demux);
+            g_print("GST_STATE_CHANGE_PAUSED_TO_READY\n");
+            /* Clean up resources */
+            if (priv->video_caps) {
+                gst_caps_unref(priv->video_caps);
+                priv->video_caps = NULL;
+            }
+            if (priv->audio_caps) {
+                gst_caps_unref(priv->audio_caps);
+                priv->audio_caps = NULL;
+            }
+            if (priv->codec_data) {
+                gst_buffer_unref(priv->codec_data);
+                priv->codec_data = NULL;
+            }
             break;
         case GST_STATE_CHANGE_READY_TO_NULL:
+            g_print("GST_STATE_CHANGE_READY_TO_NULL\n");
+            g_free(priv->location);
+            priv->location = NULL;
             break;
         default:
             break;
     }
 
     ret = GST_ELEMENT_CLASS(media_demux_parent_class)->change_state(element, transition);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        g_print("State change failed\n");
+    }
 
     return ret;
 }
 
-// 启动 Demuxer
-static gboolean media_demux_start(MediaDemux *demux) {
-    MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-    g_print("INFO: [media_demux] Starting demuxer\n");
+/* Class initialization function */
+static void media_demux_class_init(MediaDemuxClass *klass) {
+    GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
+    GstElementClass *gstelement_class = GST_ELEMENT_CLASS(klass);
 
-    if (!priv->location) {
-        g_print("ERROR: [media_demux] No location set\n");
-        return FALSE;
-    }
+    gobject_class->set_property = media_demux_set_property;
+    gobject_class->get_property = media_demux_get_property;
 
-    if (avformat_open_input(&priv->fmt_ctx, priv->location, NULL, NULL) < 0) {
-        g_print("ERROR: [media_demux] Failed to open input: %s\n", priv->location);
-        return FALSE;
-    }
+    g_object_class_install_property(
+        gobject_class,
+        PROP_LOCATION,
+        g_param_spec_string(
+            "location",
+            "Location",
+            "File path to open",
+            NULL,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
+        )
+    );
 
-    if (avformat_find_stream_info(priv->fmt_ctx, NULL) < 0) {
-        g_print("ERROR: [media_demux] Failed to find stream info\n");
-        avformat_close_input(&priv->fmt_ctx);
-        priv->fmt_ctx = NULL;
-        return FALSE;
-    }
+    gst_element_class_set_static_metadata(
+        gstelement_class,
+        "MediaDemux",
+        "Demuxer",
+        "Custom MP4 Demuxer with my_demux video caps implementation",
+        "Your Name <your.email@example.com>"
+    );
 
-    // 遍历所有流，动态创建 Pad
-    for (gint i = 0; i < priv->fmt_ctx->nb_streams; i++) {
-        AVStream *stream = priv->fmt_ctx->streams[i];
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ||
-            stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            GstPad *pad = create_and_add_pad(demux, stream);
-            if (!pad) {
-                g_print("WARNING: [media_demux] Failed to create pad for stream %d\n", i);
-                continue;
-            }
-            g_print("INFO: [media_demux] Created pad for stream %d\n", i);
-        }
-    }
+    gst_element_class_add_static_pad_template(gstelement_class, &video_src_template);
+    gst_element_class_add_static_pad_template(gstelement_class, &audio_src_template);
 
-    if (priv->video_src_pads == NULL && priv->audio_src_pads == NULL) {
-        g_print("ERROR: [media_demux] No valid video or audio streams found\n");
-        avformat_close_input(&priv->fmt_ctx);
-        priv->fmt_ctx = NULL;
-        return FALSE;
-    }
-
-    priv->started = TRUE;
-
-    if (!priv->task) {
-        priv->task = gst_task_new((GstTaskFunction)media_demux_loop, demux, NULL);
-        gst_task_set_lock(priv->task, priv->task_lock);
-    }
-
-    gst_task_start(priv->task);
-
-    return TRUE;
+    gstelement_class->change_state = GST_DEBUG_FUNCPTR(media_demux_change_state);
 }
 
-// 停止 Demuxer
-static gboolean media_demux_stop(MediaDemux *demux) {
+/* Instance initialization function */
+static void media_demux_init(MediaDemux *demux) {
     MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-    g_print("INFO: [media_demux] Stopping demuxer\n");
 
+    priv->location = NULL;
+    priv->fmt_ctx = NULL;
     priv->started = FALSE;
-
-    if (priv->task) {
-        gst_task_stop(priv->task);
-        gst_task_join(priv->task);
-        gst_object_unref(priv->task);
-        priv->task = NULL;
-    }
-
-    // 移除并释放所有动态创建的 Pad
-    GList *iter;
-    for (iter = priv->video_src_pads; iter != NULL; iter = iter->next) {
-        GstPad *pad = GST_PAD(iter->data);
-        gst_element_remove_pad(GST_ELEMENT(demux), pad);
-        gst_object_unref(pad);
-    }
-    g_list_free(priv->video_src_pads);
-    priv->video_src_pads = NULL;
-
-    for (iter = priv->audio_src_pads; iter != NULL; iter = iter->next) {
-        GstPad *pad = GST_PAD(iter->data);
-        gst_element_remove_pad(GST_ELEMENT(demux), pad);
-        gst_object_unref(pad);
-    }
-    g_list_free(priv->audio_src_pads);
-    priv->audio_src_pads = NULL;
-
-    if (priv->fmt_ctx) {
-        avformat_close_input(&priv->fmt_ctx);
-        priv->fmt_ctx = NULL;
-    }
-
-    return TRUE;
+    priv->is_demuxing = FALSE;
+    priv->video_caps = NULL;
+    priv->audio_caps = NULL;
+    priv->video_stream_idx = -1;
+    priv->audio_stream_idx = -1;
+    priv->is_adts = FALSE;
+    priv->mpeg_version = 2;  // Default MPEG version
+    priv->codec_data = NULL;
+    priv->profile = NULL;
+    priv->level = 0;
 }
 
-static int get_sample_rate_index(int sample_rate) {
-    switch (sample_rate) {
-        case 96000: return 0;
-        case 88200: return 1;
-        case 64000: return 2;
-        case 48000: return 3;
-        case 44100: return 4;
-        case 32000: return 5;
-        case 24000: return 6;
-        case 22050: return 7;
-        case 16000: return 8;
-        case 12000: return 9;
-        case 11025: return 10;
-        case 8000: return 11;
-        case 7350: return 12;
-        default: return 15; // 15 is reserved
-    }
-}
-
-static GstBuffer* convert_aac_to_adts(MediaDemux *demux, AVStream *stream, AVPacket *pkt) {
-    if (pkt->size <= 0) {
-        g_print("WARNING: [media_demux] Invalid packet size: %d\n", pkt->size);
-        return NULL;
-    }
-
-    int sample_rate_index = get_sample_rate_index(stream->codecpar->sample_rate);
-    if (sample_rate_index < 0) {
-        g_print("WARNING: [media_demux] Unsupported sample rate: %d\n", stream->codecpar->sample_rate);
-        return NULL;
-    }
-
-    int channels = stream->codecpar->ch_layout.nb_channels;
-
-    int adts_profile = 0; // 默认使用 AAC-LC
-    if (stream->codecpar->profile == FF_PROFILE_AAC_MAIN)
-        adts_profile = 0;
-    else if (stream->codecpar->profile == FF_PROFILE_AAC_LOW)
-        adts_profile = 1;
-    else if (stream->codecpar->profile == FF_PROFILE_AAC_SSR)
-        adts_profile = 2;
-
-    guint8 adts_header[7];
-    int aac_frame_length = pkt->size + 7;
-
-    adts_header[0] = 0xFF;
-    adts_header[1] = 0xF1; // 固定值
-    adts_header[2] = (adts_profile << 6) | (sample_rate_index << 2) | ((channels >> 2) & 0x1);
-    adts_header[3] = ((channels & 0x3) << 6) | ((aac_frame_length >> 11) & 0x3);
-    adts_header[4] = (aac_frame_length >> 3) & 0xFF;
-    adts_header[5] = ((aac_frame_length & 0x7) << 5) | 0x1F;
-    adts_header[6] = 0xFC;
-
-    GstBuffer *adts_buffer = gst_buffer_new_allocate(NULL, aac_frame_length, NULL);
-    GstMapInfo map;
-    if (!gst_buffer_map(adts_buffer, &map, GST_MAP_WRITE)) {
-        g_print("WARNING: [media_demux] Failed to map ADTS buffer\n");
-        gst_buffer_unref(adts_buffer);
-        return NULL;
-    }
-
-    memcpy(map.data, adts_header, 7);
-    memcpy(map.data + 7, pkt->data, pkt->size);
-    gst_buffer_unmap(adts_buffer, &map);
-
-    return adts_buffer;
-}
-
-// 推送数据函数
-static GstFlowReturn media_demux_push_data(MediaDemux *demux) {
-    MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-    AVPacket pkt;
-
-    if (av_read_frame(priv->fmt_ctx, &pkt) >= 0) {
-        GstBuffer *buffer = NULL;
-        AVStream *stream = priv->fmt_ctx->streams[pkt.stream_index];
-        GstMapInfo map;
-
-        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            buffer = gst_buffer_new_allocate(NULL, pkt.size, NULL);
-            if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
-                memcpy(map.data, pkt.data, pkt.size);
-                gst_buffer_unmap(buffer, &map);
-            } else {
-                g_print("ERROR: [media_demux] Failed to map video buffer\n");
-                gst_buffer_unref(buffer);
-                av_packet_unref(&pkt);
-                return GST_FLOW_ERROR;
-            }
-            g_print("INFO: [media_demux] Push data to video buffer, size: %d, pts: %" PRId64 "\n", pkt.size, pkt.pts);
-        } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            if (stream->codecpar->codec_id == AV_CODEC_ID_AAC) {
-                buffer = convert_aac_to_adts(demux, stream, &pkt);
-                if (!buffer) {
-                    g_print("WARNING: [media_demux] Failed to convert AAC to ADTS\n");
-                    av_packet_unref(&pkt);
-                    return GST_FLOW_ERROR;
-                }
-                g_print("INFO: [media_demux] Push data to audio buffer (AAC to ADTS), size: %zu, pts: %" PRId64 "\n", gst_buffer_get_size(buffer), pkt.pts);
-            } else {
-                buffer = gst_buffer_new_allocate(NULL, pkt.size, NULL);
-                if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
-                    memcpy(map.data, pkt.data, pkt.size);
-                    gst_buffer_unmap(buffer, &map);
-                } else {
-                    g_print("ERROR: [media_demux] Failed to map audio buffer\n");
-                    gst_buffer_unref(buffer);
-                    av_packet_unref(&pkt);
-                    return GST_FLOW_ERROR;
-                }
-                g_print("INFO: [media_demux] Push data to audio buffer, size: %d, pts: %" PRId64 "\n", pkt.size, pkt.pts);
-            }
-        }
-
-        if (buffer) {
-            GList *iter;
-            if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-                for (iter = priv->video_src_pads; iter != NULL; iter = iter->next) {
-                    GstPad *pad = GST_PAD(iter->data);
-                    GstFlowReturn ret = gst_pad_push(pad, gst_buffer_ref(buffer));
-                    g_print("LOG: [media_demux] Push data to video pad returned: %d\n", ret);
-                    if (ret != GST_FLOW_OK) {
-                        g_print("WARNING: [media_demux] Error pushing data to video pad: %d\n", ret);
-                    }
-                }
-            } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                for (iter = priv->audio_src_pads; iter != NULL; iter = iter->next) {
-                    GstPad *pad = GST_PAD(iter->data);
-                    GstFlowReturn ret = gst_pad_push(pad, gst_buffer_ref(buffer));
-                    g_print("LOG: [media_demux] Push data to audio pad returned: %d\n", ret);
-                    if (ret != GST_FLOW_OK) {
-                        g_print("WARNING: [media_demux] Error pushing data to audio pad: %d\n", ret);
-                    }
-                }
-            }
-            gst_buffer_unref(buffer);
-        }
-
-        av_packet_unref(&pkt);
-    } else {
-        // 发送 EOS 事件到所有 Pad，仅发送 eos 事件
-        GList *iter;
-        for (iter = priv->video_src_pads; iter != NULL; iter = iter->next) {
-            GstPad *pad = GST_PAD(iter->data);
-            GstEvent *eos_event = gst_event_new_eos();
-            gst_pad_push_event(pad, eos_event);
-            g_print("INFO: [media_demux] Sent EOS to video pad: %s\n", gst_pad_get_name(pad));
-        }
-        for (iter = priv->audio_src_pads; iter != NULL; iter = iter->next) {
-            GstPad *pad = GST_PAD(iter->data);
-            GstEvent *eos_event = gst_event_new_eos();
-            gst_pad_push_event(pad, eos_event);
-            g_print("INFO: [media_demux] Sent EOS to audio pad: %s\n", gst_pad_get_name(pad));
-        }
-        return GST_FLOW_EOS;
-    }
-
-    return GST_FLOW_OK;
-}
-
-// Demux 循环函数
-static void media_demux_loop(MediaDemux *demux) {
-    MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-    g_print("INFO: [media_demux] media_demux_loop enter\n");
-    while (priv->started) {
-        GstFlowReturn ret = media_demux_push_data(demux);
-        if (ret != GST_FLOW_OK) {
-            g_print("WARNING: [media_demux] Push data returned: %d, stopping loop\n", ret);
-            break;
-        }
-        // 使用更高效的同步机制代替 g_usleep
-        g_usleep(10000); // 10ms
-    }
-}
-
-// 插件初始化函数
-gboolean media_demux_plugin_init(GstPlugin *plugin) { // 移除 static
-    return gst_element_register(plugin, "media_demux", GST_RANK_NONE, media_demux_get_type());
+/* Plugin initialization function */
+gboolean media_demux_plugin_init(GstPlugin *plugin) {
+    return gst_element_register(plugin, "media_demux", GST_RANK_NONE, MEDIA_TYPE_DEMUX);
 }
 
 GST_PLUGIN_DEFINE(
     GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
     media_demux,
-    "Media Demuxer",
+    "Custom MP4 Demuxer with my_demux video caps implementation",
     media_demux_plugin_init,
     "1.0",
     "LGPL",

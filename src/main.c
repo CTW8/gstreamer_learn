@@ -8,7 +8,7 @@
 
 int my_main(int argc, char *argv[], gpointer user_data) {
     // 实现你的主函数逻辑
-    audio_player2_play(FILE_PATH);
+    media_player(FILE_PATH);
     return 0;
 }
 

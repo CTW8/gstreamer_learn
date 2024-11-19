@@ -23,7 +23,7 @@ static void on_pad_added(GstElement *element, GstPad *pad, gpointer data) {
     gst_object_unref(sink_pad);
 }
 
-void audio_player2_play(const gchar *file_path) {
+void audio_player2(const gchar *file_path) {
     GstElement *pipeline, *demuxer, *decoder, *converter, *sink;
     GstBus *bus;
     GstMessage *msg;

@@ -7,7 +7,7 @@
 
 G_BEGIN_DECLS
 
-void audio_player2_play(const gchar *file_path);
+void audio_player2(const gchar *file_path);
 
 G_END_DECLS
 

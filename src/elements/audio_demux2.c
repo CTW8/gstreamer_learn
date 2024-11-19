@@ -223,7 +223,11 @@ static GstPad* create_and_add_pad(AudioDemux2 *demux, AVStream *stream) {
     }
 
     // Set pad caps
-    gst_pad_set_caps(pad, caps);
+    if (!gst_pad_set_caps(pad, caps)) {
+        g_printerr("Failed to set caps on pad\n");
+    } else {
+        g_print("Successfully set caps on pad\n");
+    }
 
     // Push caps event
     GstEvent *caps_event = gst_event_new_caps(caps);
