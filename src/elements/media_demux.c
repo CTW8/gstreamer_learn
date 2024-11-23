@@ -28,6 +28,7 @@ typedef struct _MediaDemuxPrivate {
     GstBuffer *codec_data;  // SPS and PPS for H.264/H.265
     gchar *profile;
     gint level;
+    guint group_id;  // Added group_id
 } MediaDemuxPrivate;
 
 struct _MediaDemux {
@@ -117,14 +118,8 @@ static const gchar* get_mime_type(enum AVCodecID codec_id, enum AVMediaType medi
     }
     return "application/octet-stream";
 }
-static gboolean media_demux_start(MediaDemux *demux) {
-    g_print("media_demux_start\n");
-    MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
-    AVStream *stream;
-    gchar *stream_id;
-    GstEvent *stream_start_event, *caps_event, *segment_event;
-    GstSegment segment;
 
+static gboolean open_input_file(MediaDemuxPrivate *priv) {
     if (avformat_open_input(&priv->fmt_ctx, priv->location, NULL, NULL) != 0) {
         g_print("Failed to open input file: %s\n", priv->location);
         return FALSE;
@@ -136,7 +131,10 @@ static gboolean media_demux_start(MediaDemux *demux) {
         return FALSE;
     }
 
-    /* Select the first valid video and audio streams */
+    return TRUE;
+}
+
+static void select_streams(MediaDemuxPrivate *priv) {
     priv->video_stream_idx = -1;
     priv->audio_stream_idx = -1;
     for (unsigned int i = 0; i < priv->fmt_ctx->nb_streams; i++) {
@@ -150,6 +148,150 @@ static gboolean media_demux_start(MediaDemux *demux) {
             break;
         }
     }
+}
+
+static gboolean process_video_stream(MediaDemux *demux, MediaDemuxPrivate *priv) {
+    AVStream *stream = priv->fmt_ctx->streams[priv->video_stream_idx];
+    GstPadTemplate *video_pad_template = gst_static_pad_template_get(&video_src_template);
+    gchar *pad_name = g_strdup_printf("video_src_%u", stream->index);
+    priv->video_src_pad = gst_pad_new_from_template(video_pad_template, pad_name);
+    gst_object_unref(video_pad_template);
+
+    if (!priv->video_src_pad) {
+        g_print("Failed to create video pad from template\n");
+        return FALSE;
+    }
+
+    gst_pad_set_active(priv->video_src_pad, TRUE);
+
+    const gchar *stream_format = (stream->codecpar->codec_id == AV_CODEC_ID_H264) ? "avc" : "hvc1";
+    GstBuffer *codec_data = get_codec_data(stream->codecpar);
+    GstCaps *caps = gst_caps_new_simple(
+        "video/x-h264",
+        "stream-format", G_TYPE_STRING, stream_format,
+        "alignment", G_TYPE_STRING, "au",
+        "width", G_TYPE_INT, stream->codecpar->width,
+        "height", G_TYPE_INT, stream->codecpar->height,
+        "framerate", GST_TYPE_FRACTION, stream->avg_frame_rate.num, stream->avg_frame_rate.den,
+        "codec_data", GST_TYPE_BUFFER, codec_data,
+        NULL
+    );
+    gst_buffer_unref(codec_data);
+
+    GstEvent *stream_start_event = gst_event_new_stream_start(pad_name);
+    g_free(pad_name);
+
+    GstStructure *structure = gst_event_writable_structure(stream_start_event);
+    gst_structure_set(structure, "group-id", G_TYPE_UINT, priv->group_id, NULL);  // 增加 group-id 到 stream_start_event
+    if (!gst_pad_push_event(priv->video_src_pad, stream_start_event)) {
+        g_print("Failed to push stream start event on video pad\n");
+        return FALSE;
+    }
+
+    if (!gst_pad_set_caps(priv->video_src_pad, caps)) {
+        g_printerr("Failed to set caps on video pad\n");
+        return FALSE;
+    }
+
+    if (!gst_element_add_pad(GST_ELEMENT(demux), priv->video_src_pad)) {
+        g_print("Failed to add video pad to element\n");
+        gst_object_unref(priv->video_src_pad);
+        return FALSE;
+    }
+
+    GstEvent *caps_event = gst_event_new_caps(caps);
+    if (!gst_pad_push_event(priv->video_src_pad, caps_event)) {
+        g_print("Failed to push caps event on video pad\n");
+        return FALSE;
+    }
+    gst_caps_unref(caps);
+
+    GstSegment segment;
+    gst_segment_init(&segment, GST_FORMAT_TIME);
+    GstEvent *segment_event = gst_event_new_segment(&segment);
+    if (!gst_pad_push_event(priv->video_src_pad, segment_event)) {
+        g_print("Failed to push segment event on video pad\n");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static gboolean process_audio_stream(MediaDemux *demux, MediaDemuxPrivate *priv) {
+    AVStream *stream = priv->fmt_ctx->streams[priv->audio_stream_idx];
+    GstPadTemplate *audio_pad_template = gst_static_pad_template_get(&audio_src_template);
+    gchar *pad_name = g_strdup_printf("audio_src_%u", stream->index);
+    priv->audio_src_pad = gst_pad_new_from_template(audio_pad_template, pad_name);
+    gst_object_unref(audio_pad_template);
+
+    if (!priv->audio_src_pad) {
+        g_print("Failed to create audio pad from template\n");
+        return FALSE;
+    }
+
+    gst_pad_set_active(priv->audio_src_pad, TRUE);
+
+    const gchar *stream_format = (stream->codecpar->codec_id == AV_CODEC_ID_AAC) ? "adts" : "raw";
+    GstCaps *caps = gst_caps_new_simple(
+        "audio/mpeg",
+        "mpegversion", G_TYPE_INT, 4,
+        "stream-format", G_TYPE_STRING, stream_format,
+        "rate", G_TYPE_INT, stream->codecpar->sample_rate,
+        "channels", G_TYPE_INT, stream->codecpar->ch_layout.nb_channels,
+        NULL
+    );
+
+    // gchar *stream_id = gst_pad_create_stream_id(priv->audio_src_pad, GST_ELEMENT(demux), pad_name);
+    // g_print("stream_id: %s\n", stream_id);
+    GstEvent *stream_start_event = gst_event_new_stream_start(pad_name);
+    // g_free(stream_id);
+    g_free(pad_name);
+
+    GstStructure *structure = gst_event_writable_structure(stream_start_event);
+    gst_structure_set(structure, "group-id", G_TYPE_UINT, priv->group_id, NULL);  // Added group-id to stream_start_event
+    if (!gst_pad_push_event(priv->audio_src_pad, stream_start_event)) {
+        g_print("Failed to push stream start event on audio pad\n");
+        return FALSE;
+    }
+
+    if (!gst_pad_set_caps(priv->audio_src_pad, caps)) {
+        g_printerr("Failed to set caps on audio pad\n");
+        return FALSE;
+    }
+
+    if (!gst_element_add_pad(GST_ELEMENT(demux), priv->audio_src_pad)) {
+        g_print("Failed to add audio pad to element\n");
+        gst_object_unref(priv->audio_src_pad);
+        return FALSE;
+    }
+
+    GstEvent *caps_event = gst_event_new_caps(caps);
+    if (!gst_pad_push_event(priv->audio_src_pad, caps_event)) {
+        g_print("Failed to push caps event on audio pad\n");
+        return FALSE;
+    }
+    gst_caps_unref(caps);
+
+    GstSegment segment;
+    gst_segment_init(&segment, GST_FORMAT_TIME);
+    GstEvent *segment_event = gst_event_new_segment(&segment);
+    if (!gst_pad_push_event(priv->audio_src_pad, segment_event)) {
+        g_print("Failed to push segment event on audio pad\n");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static gboolean media_demux_start(MediaDemux *demux) {
+    g_print("media_demux_start\n");
+    MediaDemuxPrivate *priv = media_demux_get_instance_private(demux);
+
+    if (!open_input_file(priv)) {
+        return FALSE;
+    }
+
+    select_streams(priv);
 
     if (priv->video_stream_idx == -1 && priv->audio_stream_idx == -1) {
         g_print("No valid audio or video stream found\n");
@@ -157,132 +299,14 @@ static gboolean media_demux_start(MediaDemux *demux) {
         return FALSE;
     }
 
-    /* Process video stream */
     if (priv->video_stream_idx != -1) {
-        g_print("####start video stream\n");
-        stream = priv->fmt_ctx->streams[priv->video_stream_idx];
-
-        GstPadTemplate *video_pad_template = gst_static_pad_template_get(&video_src_template);
-        gchar *pad_name = g_strdup_printf("video_src_%u", stream->index);
-        priv->video_src_pad = gst_pad_new_from_template(video_pad_template, pad_name);
-        gst_object_unref(video_pad_template);
-        g_free(pad_name);
-        g_print("### %s #1\n", __FUNCTION__);
-        if (!priv->video_src_pad) {
-            g_print("Failed to create video pad from template\n");
-            return FALSE;
-        }
-
-        g_print("### %s #21\n", __FUNCTION__);
-        gst_pad_set_active(priv->video_src_pad, TRUE);
-        g_print("gst_pad_set_active(priv->video_src_pad, TRUE)\n");
-        /* Send stream-start event */
-        stream_id = gst_pad_create_stream_id(priv->video_src_pad, GST_ELEMENT(demux), pad_name);
-        stream_start_event = gst_event_new_stream_start(stream_id);
-        g_free(stream_id);
-        gst_pad_push_event(priv->video_src_pad, stream_start_event);
-
-        /* Set Caps based on codec parameters */
-        const gchar *stream_format = (stream->codecpar->codec_id == AV_CODEC_ID_H264) ? "avc" : "hvc1";
-        GstBuffer *codec_data = get_codec_data(stream->codecpar);
-        GstCaps *caps = gst_caps_new_simple(
-            "video/x-h264",
-            "stream-format", G_TYPE_STRING, stream_format,
-            "alignment", G_TYPE_STRING, "au",
-            "width", G_TYPE_INT, stream->codecpar->width,
-            "height", G_TYPE_INT, stream->codecpar->height,
-            "framerate", GST_TYPE_FRACTION, stream->avg_frame_rate.num, stream->avg_frame_rate.den,
-            "codec_data", GST_TYPE_BUFFER, codec_data,
-            NULL
-        );
-        gst_buffer_unref(codec_data);
-        g_print("### %s #4\n", __FUNCTION__);
-        if (!gst_pad_set_caps(priv->video_src_pad, caps)) {
-            g_printerr("Failed to set caps on video pad\n");
-            return FALSE;
-        }
-        g_print("### %s #6\n", __FUNCTION__);
-        caps_event = gst_event_new_caps(caps);
-        gst_pad_push_event(priv->video_src_pad, caps_event);
-        gst_caps_unref(caps);
-
-        /* Send segment event */
-        gst_segment_init(&segment, GST_FORMAT_TIME);
-        segment_event = gst_event_new_segment(&segment);
-        gst_pad_push_event(priv->video_src_pad, segment_event);
-
-        GstCaps *current_caps = gst_pad_get_current_caps(priv->video_src_pad);
-        gchar *caps_str = gst_caps_to_string(current_caps);
-        g_print("[MediaDemxu] Current caps of video_src_pad: %s\n", caps_str);
-        g_free(caps_str);
-        gst_caps_unref(current_caps);
-
-        // g_signal_emit_by_name(demux, "pad-added", priv->video_src_pad);
-        if (!gst_element_add_pad(GST_ELEMENT(demux), priv->video_src_pad)) {
-            g_print("Failed to add video pad to element\n");
-            gst_object_unref(priv->video_src_pad);
+        if (!process_video_stream(demux, priv)) {
             return FALSE;
         }
     }
 
-    /* Process audio stream */
     if (priv->audio_stream_idx != -1) {
-        g_print("start audio stream\n");
-        stream = priv->fmt_ctx->streams[priv->audio_stream_idx];
-        GstPadTemplate *audio_pad_template = gst_static_pad_template_get(&audio_src_template);
-        gchar *pad_name = g_strdup_printf("audio_src_%u", stream->index);
-        priv->audio_src_pad = gst_pad_new_from_template(audio_pad_template, pad_name);
-        gst_object_unref(audio_pad_template);
-        g_free(pad_name);
-
-        if (!priv->audio_src_pad) {
-            g_print("Failed to create audio pad from template\n");
-            return FALSE;
-        }
-
-        gst_pad_set_active(priv->audio_src_pad, TRUE);
-
-        /* Send stream-start event */
-        stream_id = gst_pad_create_stream_id(priv->audio_src_pad, GST_ELEMENT(demux), pad_name);
-        stream_start_event = gst_event_new_stream_start(stream_id);
-        g_free(stream_id);
-        gst_pad_push_event(priv->audio_src_pad, stream_start_event);
-
-        /* Set Caps based on codec parameters */
-        const gchar *stream_format = (stream->codecpar->codec_id == AV_CODEC_ID_AAC) ? "adts" : "raw";
-        GstCaps *caps = gst_caps_new_simple(
-            "audio/mpeg",
-            "mpegversion", G_TYPE_INT, 4,
-            "stream-format", G_TYPE_STRING, stream_format,
-            "rate", G_TYPE_INT, stream->codecpar->sample_rate,
-            "channels", G_TYPE_INT, stream->codecpar->ch_layout.nb_channels,
-            NULL
-        );
-
-        if (!gst_pad_set_caps(priv->audio_src_pad, caps)) {
-            g_printerr("Failed to set caps on audio pad\n");
-            return FALSE;
-        }
-
-        caps_event = gst_event_new_caps(caps);
-        gst_pad_push_event(priv->audio_src_pad, caps_event);
-        gst_caps_unref(caps);
-
-        /* Send segment event */
-        gst_segment_init(&segment, GST_FORMAT_TIME);
-        segment_event = gst_event_new_segment(&segment);
-        gst_pad_push_event(priv->audio_src_pad, segment_event);
-
-        GstCaps *current_caps = gst_pad_get_current_caps(priv->audio_src_pad);
-        gchar *caps_str = gst_caps_to_string(current_caps);
-        g_print("Audio src pad caps: %s\n", caps_str);
-        g_free(caps_str);
-        gst_caps_unref(current_caps);
-
-        // g_signal_emit_by_name(demux, "pad-added", priv->audio_src_pad);
-        if (!gst_element_add_pad(GST_ELEMENT(demux), priv->audio_src_pad)) {
-            g_print("Failed to add audio pad to element\n");
-            gst_object_unref(priv->audio_src_pad);
+        if (!process_audio_stream(demux, priv)) {
             return FALSE;
         }
     }
@@ -325,11 +349,11 @@ static GstBuffer* add_adts_header(GstBuffer *buffer, AVCodecParameters *codecpar
     guint8 adts_header[7];
     guint16 frame_length = map.size + 7;
 
-    static const guint8 sample_rate_index[] = {
+    static const gint sample_rate_index[] = {
         96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350
     };
-    guint8 sr_index = 0;
-    for (guint8 i = 0; i < G_N_ELEMENTS(sample_rate_index); i++) {
+    static guint8 sr_index = 0;
+    for (guint16 i = 0; i < G_N_ELEMENTS(sample_rate_index); i++) {
         if (sample_rate_index[i] == codecpar->sample_rate) {
             sr_index = i;
             break;
@@ -416,13 +440,19 @@ static void *demux_thread_func(void *data) {
     /* Send EOS event */
     if (priv->video_stream_idx != -1) {
         GstEvent *eos_event = gst_event_new_eos();
-        gst_pad_push_event(priv->video_src_pad, eos_event);
-        g_print("EOS event sent on video pad\n");
+        if (!gst_pad_push_event(priv->video_src_pad, eos_event)) {
+            g_print("Failed to push EOS event on video pad\n");
+        } else {
+            g_print("EOS event sent on video pad\n");
+        }
     }
     if (priv->audio_stream_idx != -1) {
         GstEvent *eos_event = gst_event_new_eos();
-        gst_pad_push_event(priv->audio_src_pad, eos_event);
-        g_print("EOS event sent on audio pad\n");
+        if (!gst_pad_push_event(priv->audio_src_pad, eos_event)) {
+            g_print("Failed to push EOS event on audio pad\n");
+        } else {
+            g_print("EOS event sent on audio pad\n");
+        }
     }
     avformat_close_input(&priv->fmt_ctx);
 
@@ -450,14 +480,14 @@ static GstStateChangeReturn media_demux_change_state(GstElement *element, GstSta
                 g_print("Location property is not set\n");
                 return GST_STATE_CHANGE_FAILURE;
             }
-            if (!media_demux_start(demux)) {
-                g_print("Failed to start demuxing\n");
-                return GST_STATE_CHANGE_FAILURE;
-            }
             break;
         case GST_STATE_CHANGE_READY_TO_PAUSED:
             g_print("GST_STATE_CHANGE_READY_TO_PAUSED\n");
             priv->is_demuxing = TRUE;
+            if (!media_demux_start(demux)) {
+                g_print("Failed to start demuxing\n");
+                return GST_STATE_CHANGE_FAILURE;
+            }
             if (pthread_create(&priv->demux_thread, NULL, demux_thread_func, demux) != 0) {
                 g_print("Failed to create demux thread\n");
                 priv->is_demuxing = FALSE;
@@ -558,6 +588,7 @@ static void media_demux_init(MediaDemux *demux) {
     priv->codec_data = NULL;
     priv->profile = NULL;
     priv->level = 0;
+    priv->group_id = g_random_int();  // Initialize group_id with random value
 }
 
 /* Plugin initialization function */

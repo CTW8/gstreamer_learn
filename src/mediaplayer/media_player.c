@@ -41,22 +41,18 @@ static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer data) {
 /* Unified pad added signal handler */
 static void on_pad_added(GstElement *element, GstPad *pad, gpointer data) {
     g_print("##########on_pad_added#########\n");
-    GstElement *audio_decoder = ((GstElement **)data)[0];
-    GstElement *h264parse = ((GstElement **)data)[1];
+    GstElement *audio_queue = ((GstElement **)data)[0];
+    GstElement *video_queue = ((GstElement **)data)[1];
     GstPad *sink_pad = NULL;
 
     GstCaps *new_pad_caps = gst_pad_get_current_caps(pad);
-    gchar *caps_str = gst_caps_to_string(new_pad_caps);
-    g_print("New pad caps: %s\n", caps_str);
-    g_free(caps_str);
-
     GstStructure *new_pad_struct = gst_caps_get_structure(new_pad_caps, 0);
     const gchar *new_pad_type = gst_structure_get_name(new_pad_struct);
 
     if (g_str_has_prefix(new_pad_type, "audio/")) {
-        sink_pad = gst_element_get_static_pad(audio_decoder, "sink");
+        sink_pad = gst_element_get_static_pad(audio_queue, "sink");
     } else if (g_str_has_prefix(new_pad_type, "video/")) {
-        sink_pad = gst_element_get_static_pad(h264parse, "sink");
+        sink_pad = gst_element_get_static_pad(video_queue, "sink");
     }
 
     if (sink_pad && !gst_pad_is_linked(sink_pad)) {
@@ -77,7 +73,7 @@ static void on_pad_added(GstElement *element, GstPad *pad, gpointer data) {
 
 int media_player(const char *file_path) {
     GMainLoop *loop;
-    GstElement *pipeline, *demux, *audio_decoder, *audio_convert, *audio_sink, *h264parse, *video_decoder, *video_sink;
+    GstElement *pipeline, *demux, *audio_queue, *audio_decoder, *audio_convert, *audio_sink, *video_queue, *h264parse, *video_decoder, *video_sink;
     GstBus *bus;
     guint bus_watch_id;
 
@@ -91,14 +87,16 @@ int media_player(const char *file_path) {
     /* Create elements */
     pipeline = gst_pipeline_new("media-player");
     demux = gst_element_factory_make("media_demux", "demux");
+    audio_queue = gst_element_factory_make("queue", "audio-queue");
     audio_decoder = gst_element_factory_make("avdec_aac", "audio-decoder");
     audio_convert = gst_element_factory_make("audioconvert", "audio-convert");
     audio_sink = gst_element_factory_make("autoaudiosink", "audio-output");
+    video_queue = gst_element_factory_make("queue", "video-queue");
     h264parse = gst_element_factory_make("h264parse", "h264-parse");
     video_decoder = gst_element_factory_make("avdec_h264", "video-decoder");
     video_sink = gst_element_factory_make("glimagesink", "video-output");
 
-    if (!pipeline || !demux || !audio_decoder || !audio_convert || !audio_sink || !h264parse || !video_decoder || !video_sink) {
+    if (!pipeline || !demux || !audio_queue || !audio_decoder || !audio_convert || !audio_sink || !video_queue || !h264parse || !video_decoder || !video_sink) {
         g_printerr("Failed to create GStreamer elements.\n");
         return -1;
     }
@@ -107,27 +105,27 @@ int media_player(const char *file_path) {
     g_object_set(G_OBJECT(demux), "location", file_path, NULL);
 
     /* Add elements to the pipeline */
-    gst_bin_add_many(GST_BIN(pipeline), demux, audio_decoder, audio_convert, audio_sink, h264parse, video_decoder, video_sink, NULL);
+    gst_bin_add_many(GST_BIN(pipeline), demux, audio_queue, audio_decoder, audio_convert, audio_sink, video_queue, h264parse, video_decoder, video_sink, NULL);
 
     /* Link audio elements */
-    if (!gst_element_link_many(audio_decoder, audio_convert, audio_sink, NULL)) {
+    if (!gst_element_link_many(audio_queue, audio_decoder, audio_convert, audio_sink, NULL)) {
         g_printerr("Failed to link audio elements.\n");
         gst_object_unref(pipeline);
         return -1;
     }
 
     /* Link video elements */
-    if (!gst_element_link_many(h264parse, video_decoder, video_sink, NULL)) {
+    if (!gst_element_link_many(video_queue, h264parse, video_decoder, video_sink, NULL)) {
         g_printerr("Failed to link video elements.\n");
         gst_object_unref(pipeline);
         return -1;
     }
 
     /* Connect pad-added signal */
-    GstElement *elements[] = {audio_decoder, h264parse};
+    GstElement *elements[] = {audio_queue, video_queue};
     g_signal_connect(demux, "pad-added", G_CALLBACK(on_pad_added), elements);
 
-        /* Set the pipeline to playing state */
+    /* Set the pipeline to playing state */
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
     /* Add a bus watch to handle messages */
